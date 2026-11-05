@@ -9,8 +9,10 @@ constexpr uint32_t kFmSimtWqeOffset = 256U;
 static_assert(kFmSimtWqeOffset + kFmBuildRows * 64U <= kUdmaWqeScratchBytes);
 
 // Consume only row pairs whose source-ready has already been acquired.
-__aicore__ inline void IssueFmRows(DeepepSecondaryState& s, uint32_t peer, __ubuf__ uint8_t* scratch,
-                                   LocalTensor<uint32_t> rows, uint32_t first, uint32_t count)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void IssueFmRows(DeepepSecondaryState<World, RowBytes, TopK>& s, uint32_t peer,
+                                   __ubuf__ uint8_t* scratch, LocalTensor<uint32_t> rows, uint32_t first,
+                                   uint32_t count)
 {
     if (!count || count > 32U) {
         aclshmemi_kernel_abort("FM SIMT invalid batch size");
@@ -54,8 +56,9 @@ __aicore__ inline void IssueFmRows(DeepepSecondaryState& s, uint32_t peer, __ubu
     // carry), already completed by the caller. Do not drain the unrelated
     // next metadata-bank prefetch here. Primary's GM-loaded pairs keep their
     // own MTE2 dependency in IssueFmPrimaryPlanRange.
-    asc_vf_call<DispatchBuildFmWqesVf>(dim3(32), wqes, header, reinterpret_cast<__ubuf__ int32_t*>(rows.GetPhyAddr()),
-                                       first, count, s.row_bytes, reinterpret_cast<uint64_t>(s.hidden), header[5]);
+    asc_vf_call<DispatchBuildFmWqesVf<RowBytes>>(dim3(32), wqes, header,
+                                                 reinterpret_cast<__ubuf__ int32_t*>(rows.GetPhyAddr()), first, count,
+                                                 reinterpret_cast<uint64_t>(s.hidden), header[5]);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     // The consumer is MTE3, not scalar; the V->MTE3 dependency above covers

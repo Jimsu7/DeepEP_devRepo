@@ -586,7 +586,7 @@ def assert_bytes(actual, expected, name, progress=None):
         progress(f"{name}: precision.passed")
 
 
-_PROFILE_KERNELS = {"notify": "notify_full_kernel", "dispatch": "dispatch_kernel", "combine": "combine_kernel"}
+_PROFILE_KERNELS = {"notify": "notify_full_kernel", "dispatch": "dispatch_jit_kernel", "combine": "combine_kernel"}
 _PROFILE_L2_BYTES = 8_000_000_000
 
 

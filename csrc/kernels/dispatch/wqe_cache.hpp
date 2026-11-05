@@ -12,15 +12,15 @@ constexpr uint32_t kClosBuiltWqesEnd = kClosBuiltWqesBase + kClosCacheEntries * 
 static_assert(kClosCacheBase + kClosCacheEntries * kClosCacheStride <= kClosBuiltWqesBase);
 static_assert(kClosBuiltWqesEnd <= kSlotSelectUbBytes);
 
-template <bool Profile>
-__aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryState& s, uint32_t peer, uint32_t qp,
-                                                             __gm__ uint32_t* first, uint32_t remaining,
-                                                             uint32_t emit_count, uint64_t source, uint64_t target,
-                                                             __ubuf__ uint8_t* scratch,
+template <bool Profile, uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryState<World, RowBytes, TopK>& s,
+                                                             uint32_t peer, uint32_t qp, __gm__ uint32_t* first,
+                                                             uint32_t remaining, uint32_t emit_count, uint64_t source,
+                                                             uint64_t target, __ubuf__ uint8_t* scratch,
                                                              TBuf<QuePosition::VECCALC>& slots)
 {
     // EP512 keeps the bounded per-visit builder; doubling this cache exceeds UB.
-    if (s.world > kClosCacheEntries * 8U) {
+    if (World > kClosCacheEntries * 8U) {
         const uint64_t load_start = DetailClock<Profile>(s.detail_mode);
         auto rows = slots.Get<uint32_t>();
         NativeLoad(rows, first, emit_count * 2U);
@@ -37,9 +37,9 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        asc_vf_call<DispatchBuildPeerTableWqesVf>(dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()),
-                                                  header, reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()),
-                                                  emit_count, s.row_bytes, source, target);
+        asc_vf_call<DispatchBuildPeerTableWqesVf<RowBytes>>(
+            dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()), header,
+            reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()), emit_count, source, target);
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         DetailAdd<Profile>(s.detail, 8U, DetailClock<Profile>(s.detail_mode) - build_start);
@@ -68,7 +68,7 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
     }
     const uint64_t address = reinterpret_cast<uint64_t>(first);
     auto output = slots.GetWithOffset<uint64_t>(kClosBuildRows * 8U, kClosBuiltWqesBase + entry * kClosBuiltWqesStride);
-    if (address < tag[1] || address + uint64_t(emit_count) * 8U > tag[2] || tag[3] != source || tag[4] != s.row_bytes) {
+    if (address < tag[1] || address + uint64_t(emit_count) * 8U > tag[2] || tag[3] != source || tag[4] != RowBytes) {
         const uint32_t count = remaining < kClosBuildRows ? remaining : kClosBuildRows;
         auto rows = storage[16U].ReinterpretCast<uint32_t>();
         const uint64_t load_start = DetailClock<Profile>(s.detail_mode);
@@ -79,16 +79,16 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        asc_vf_call<DispatchBuildPeerTableWqesVf>(dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()),
-                                                  header, reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()),
-                                                  count, s.row_bytes, source, target);
+        asc_vf_call<DispatchBuildPeerTableWqesVf<RowBytes>>(
+            dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()), header,
+            reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()), count, source, target);
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         DetailAdd<Profile>(s.detail, 8U, DetailClock<Profile>(s.detail_mode) - build_start);
         tag[1] = address;
         tag[2] = address + uint64_t(count) * 8U;
         tag[3] = source;
-        tag[4] = s.row_bytes;
+        tag[4] = RowBytes;
     }
     // One 8-byte row pair maps to eight uint64 words in the WQE cache.
     return output[address - tag[1]];

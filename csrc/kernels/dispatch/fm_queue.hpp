@@ -59,17 +59,21 @@ __aicore__ inline void PublishFmPreparedRows(__ubuf__ uint8_t* wqes, uint32_t co
 
 // Separate scratch preserves the cached RO header and any prebuilt descriptors.
 // The fence is SHMEM storage, not an ordinary output VA or a source-ready flag.
-__aicore__ inline void FinishFmRows(DeepepSecondaryState& s, uint32_t peer, __ubuf__ uint8_t* scratch)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void FinishFmRows(DeepepSecondaryState<World, RowBytes, TopK>& s, uint32_t peer,
+                                    __ubuf__ uint8_t* scratch)
 {
-    auto* flag = reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(s.world) * kRankSyncSlotBytes + kFmFenceOffset +
+    auto* flag = reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(World) * kRankSyncSlotBytes + kFmFenceOffset +
                                                     uint64_t(s.rank % 8U) * 512U);
-    auto* value = GetPeerCompletionFlag(s.rank, GetGroupRankIndex(peer, s.world), kPeerCompletionValueSlot, s.sync);
+    auto* value = GetPeerCompletionFlag(s.rank, GetGroupRankIndex<World>(peer), kPeerCompletionValueSlot, s.sync);
     aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kUdmaSyncSoCqeConfig>(
         flag, value, reinterpret_cast<__ubuf__ uint64_t*>(scratch + kFmControlScratchOffset), 1U, peer, 0U, EVENT_ID0);
 }
 
-__aicore__ inline void AdmitFmRows(DeepepSecondaryState& s, uint32_t peer, __ubuf__ uint8_t* scratch,
-                                   __gm__ aclshmemi_udma_queue_state_t* state, uint32_t count)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void AdmitFmRows(DeepepSecondaryState<World, RowBytes, TopK>& s, uint32_t peer,
+                                   __ubuf__ uint8_t* scratch, __gm__ aclshmemi_udma_queue_state_t* state,
+                                   uint32_t count)
 {
     if (count > kFmMaxAdmittedRows) {
         aclshmemi_kernel_abort("FM admission exceeds SQ capacity");
@@ -91,7 +95,9 @@ __aicore__ inline void AdmitFmRows(DeepepSecondaryState& s, uint32_t peer, __ubu
 
 // Remote readers still need the primary-data boundary, but the sender does
 // not need its CQE. The terminal SO later covers both this SO and forwarding.
-__aicore__ inline void PublishFmSourceReady(DeepepSecondaryState& s, uint32_t peer, __ubuf__ uint8_t* scratch)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void PublishFmSourceReady(DeepepSecondaryState<World, RowBytes, TopK>& s, uint32_t peer,
+                                            __ubuf__ uint8_t* scratch)
 {
     auto* info = aclshmemi_udma_qp_info_fetch();
     const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
@@ -99,8 +105,8 @@ __aicore__ inline void PublishFmSourceReady(DeepepSecondaryState& s, uint32_t pe
     auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
     AdmitFmRows(s, peer, scratch, state, 0U);
     auto* wqe = scratch + kFmControlScratchOffset;
-    auto* flag = GetPeerCompletionFlag(s.rank, GetGroupRankIndex(peer, s.world), 0U, s.sync);
-    auto* value = GetPeerCompletionFlag(s.rank, GetGroupRankIndex(peer, s.world), kPeerCompletionValueSlot, s.sync);
+    auto* flag = GetPeerCompletionFlag(s.rank, GetGroupRankIndex<World>(peer), 0U, s.sync);
+    auto* value = GetPeerCompletionFlag(s.rank, GetGroupRankIndex<World>(peer), kPeerCompletionValueSlot, s.sync);
     auto* target = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(flag, peer));
     // Immediate SDK put requires CQE=1, so build the unsignaled SO explicitly.
     aclshmemi_udma_fill_sqe_base_ctx<uint64_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,

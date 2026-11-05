@@ -149,6 +149,8 @@ def source_fingerprint():
             "experiments/ep_gmm_fused/tests/requirements.txt",
             "third-party/deepseek-deepep.LICENSE",
             "third-party/cann.LICENSE",
+            "third-party/deep_jit/REVISION",
+            "third-party/deep_jit/LICENSE",
         )
     ]
     for name in (
@@ -160,12 +162,14 @@ def source_fingerprint():
         "benchmarks",
         "experiments/megamoe",
         "experiments/ep_gmm_fused",
+        "third-party/deep_jit",
     ):
         files.extend(
             path
             for path in (ROOT / name).rglob("*")
             if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
+            and not path.is_relative_to(ROOT / "deep_ep/jit")
         )
     digest = hashlib.sha256()
     for path in sorted(files):
@@ -232,7 +236,36 @@ def find_host_compiler(env):
             continue
         return compiler, version
     prefix = "Explicit CXX is unusable" if explicit else "No runnable Host C++ compiler found"
-    raise RuntimeError(f"{prefix}. Set CXX to a C++17 compiler executable. Tried: " + "; ".join(failures))
+    raise RuntimeError(f"{prefix}. Set CXX to a C++20 compiler executable. Tried: " + "; ".join(failures))
+
+
+def dispatch_jit_configuration():
+    """HT dispatch always requires DeepJIT and matching framework Host libraries."""
+    try:
+        import torch
+        import torch_npu
+    except ImportError as exc:
+        raise RuntimeError("HT dispatch builds require torch and torch_npu in the build environment") from exc
+    dependency = ROOT / "third-party/deep_jit"
+    revision = dependency / "REVISION"
+    headers = sorted(path for path in (dependency / "include").rglob("*") if path.is_file())
+    if not revision.is_file() or not headers:
+        raise RuntimeError("HT dispatch builds require vendored DeepJIT REVISION and headers")
+    identity = dict(
+        revision=revision.read_text().strip(),
+        headers={
+            path.relative_to(dependency).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in headers
+        },
+        torch=torch.__version__,
+        torch_npu=torch_npu.__version__,
+        torch_cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        specialization_schema="direct-world-hidden-topk-fp8-weights-profile-v2",
+    )
+    paths = {
+        "Torch_DIR": str(Path(torch.__file__).parent / "share/cmake/Torch"),
+        "TORCH_NPU_PATH": str(Path(torch_npu.__file__).parent),
+    }
+    return identity, paths
 
 
 def build_configuration(environment=None):
@@ -411,6 +444,7 @@ def build_configuration(environment=None):
             "Torch_DIR": str(Path(torch.__file__).parent / "share/cmake/Torch"),
             "TORCH_NPU_PATH": str(Path(torch_npu.__file__).parent),
         }
+    result["dispatch_jit"], result["dispatch_jit_paths"] = dispatch_jit_configuration()
     return result
 
 
@@ -440,7 +474,20 @@ def publish_source_native(destination):
     for name in SHMEM_RUNTIME_LIBRARIES:
         if not (destination / ".libs" / name).is_file():
             raise RuntimeError(f"Incomplete native build: {destination / '.libs' / name}")
-    names.append(".libs")
+    # Source imports must use the JIT headers from the same completed build as
+    # the native extension, even after setuptools removes its staging directory.
+    jit_files = {Path("kernels/dispatch/dispatch_impl.hpp"), Path("DeepJIT.LICENSE")}
+    kernel_root = ROOT / "csrc/kernels"
+    jit_files.update(
+        Path("kernels") / path.relative_to(kernel_root)
+        for path in kernel_root.rglob("*")
+        if path.is_file() and path.suffix in {".hpp", ".h"}
+    )
+    for name in sorted(jit_files):
+        if not (destination / "jit" / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / 'jit' / name}")
+    directories = {".libs", "jit"}
+    names.extend((".libs", "jit"))
     anchor = package / ".native-build"
     storage = ROOT / "build" / "source-native"
     if anchor.exists() and not anchor.is_symlink():
@@ -458,7 +505,7 @@ def publish_source_native(destination):
     storage.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
     for name in names:
-        if name == ".libs":
+        if name in directories:
             shutil.copytree(destination / name, snapshot / name)
         else:
             shutil.copy2(destination / name, snapshot / name)
@@ -466,7 +513,7 @@ def publish_source_native(destination):
     # the previous snapshot until the anchor is atomically replaced.
     for name in names:
         if name not in managed:
-            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name in directories)
     pending = snapshot / "anchor"
     pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
     os.replace(pending, anchor)
@@ -518,6 +565,7 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]
+        arguments.extend(f"-D{name}={value}" for name, value in configuration["dispatch_jit_paths"].items())
         if ep_gmm_fused:
             arguments.extend(
                 [
@@ -546,6 +594,7 @@ class CMakeBuild(build_ext):
                 "CATLASS_ROOT",
                 "compiler_path",
                 "ep_gmm_fused_paths",
+                "dispatch_jit_paths",
                 "cmake_path",
                 "python_executable",
                 "build_environment",

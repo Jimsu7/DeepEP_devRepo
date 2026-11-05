@@ -42,9 +42,9 @@ _PERSISTENT = (
 )
 
 
-def _collective_check(runtime, error, signature, operation, phase=0):
-    """Validate locally, or exchange fixed-size preflight records in debug mode."""
-    if not runtime.debug_collectives or runtime.group is None:
+def _collective_check(runtime, error, signature, operation, phase=0, *, force=False):
+    """Exchange fixed-size records for debug checks or forced JIT preflight."""
+    if runtime.group is None or not (runtime.debug_collectives or force):
         if error is not None:
             raise error
         return
@@ -211,8 +211,9 @@ class ElasticBuffer:
         Dispatch and LL require combine_only=False. SDKs with peer-mask support
         use sparse channels; DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission.
         All ranks must agree on configuration and collective call order.
-        debug_collectives=True requires a group and enables HT preflight collectives.
-        Otherwise HT checks parameters locally; the caller handles job-wide failure.
+        An EP group always preflights HT dispatch parameters and JIT compilation.
+        debug_collectives=True requires a group and adds Notify/Combine preflight checks.
+        Without a group, checks are local; the caller handles job-wide failure.
         num_bytes is the entire symmetric workspace, cleared at construction.
         The workspace uses 1 GiB pages by default; allocation failure does not fall back to smaller pages.
         Dispatch validates exactly 8 GiB when selecting LL; no extra allocation.
@@ -858,10 +859,13 @@ class ElasticBuffer:
                     int(fp8),
                     int(topk_weights is not None),
                     int(handle is not None),
+                    runtime.world_size,
                 ]
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, signature, "Dispatch")
+            # A local validation failure must not leave other ranks waiting in
+            # the forced compilation preflight reached later in this call.
+            _collective_check(runtime, error, signature, "Dispatch", force=True)
 
             if handle is None:
                 _, _, _, handle, _ = self._notify(
@@ -886,7 +890,16 @@ class ElasticBuffer:
                     False,
                 )
             error, tensors = None, {}
-            payload_signature = signature + [0, int(runtime.native.peer_table), int(hasattr(handle, "_peer_plan"))]
+            # Complete six-field JIT identity: World/Hidden/TopK/Fp8/WithWeights
+            # are in signature; Profile is appended after diagnostics are known.
+            # The extra dedup field protects the latest rank/server return plan.
+            payload_signature = signature + [
+                0,
+                int(runtime.native.peer_table),
+                int(hasattr(handle, "_peer_plan")),
+                0,
+                0,
+            ]
             try:
                 rows, local_rows = handle.address_stride, handle.num_expanded_tokens
                 layout_key = (runtime.world_size, tokens, topk, num_experts, rows, fp8, topk_weights is not None, width)
@@ -903,7 +916,7 @@ class ElasticBuffer:
                     raise ValueError(
                         f"Dispatch needs at least {2 * layout['num_bytes']} SHMEM bytes per rank for the actual receive counts"
                     )
-                payload_signature[-3] = rows
+                payload_signature[len(signature)] = rows
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
@@ -955,6 +968,9 @@ class ElasticBuffer:
                         tensors["rotation_wqes"] = diagnostics.get("rotation_wqes", 4)
                         tensors["detail_profile"] = diagnostics.get("detail_profile")
                         tensors["detail_mode"] = diagnostics.get("detail_mode", 0)
+                    profile = tensors.get("profile") is not None
+                    payload_signature[-2] = int(profile)
+                    payload_signature[-1] = tensors["dedup_group_size"]
                     retained = tuple(value for value in tensors.values() if torch.is_tensor(value)) + (
                         handle.topk_idx,
                         *(getattr(handle, name) for name in _PERSISTENT),
@@ -970,12 +986,17 @@ class ElasticBuffer:
                             *(("_peer_plan",) if peer_plan is not None else ()),
                         )
                     }
-                    # Debug preflight also propagates asynchronous preparation errors.
+                    # Compile/load failures must reach every EP rank before
+                    # native payload execution, independently of debug checks.
+                    from ..._jit import prepare
+
+                    prepare(native, runtime.world_size, width, topk, fp8, topk_weights is not None, profile)
+                    # Preserve latest debug-only asynchronous preparation sync.
                     if runtime.debug_collectives and not handle._routing_versions:
                         runtime.stream.synchronize()
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, payload_signature, "Dispatch", phase=1)
+            _collective_check(runtime, error, payload_signature, "Dispatch", phase=1, force=True)
             runtime.notify_inflight = retained
             try:
                 with npu.stream(runtime.stream):

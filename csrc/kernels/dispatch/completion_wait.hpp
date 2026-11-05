@@ -4,7 +4,7 @@
 
 #include "aggregate_packet.hpp"
 
-template <typename Scratch>
+template <uint32_t World, typename Scratch>
 __aicore__ inline void WaitDispatchIncoming(GM_ADDR workspace, const DispatchTiling& t, Scratch& scratch)
 {
     // AIV7 finishes its local-copy/relay-assist role before becoming the sole
@@ -12,14 +12,14 @@ __aicore__ inline void WaitDispatchIncoming(GM_ADDR workspace, const DispatchTil
     // additional SyncAll is required and no caller collective is hidden here.
     if (GetBlockIdx() != 7U) return;
     const uint32_t local_begin = t.rank / 8U * 8U;
-    const uint32_t local_end = local_begin + 8U < t.world ? local_begin + 8U : t.world;
+    const uint32_t local_end = local_begin + 8U < World ? local_begin + 8U : World;
     // Clos QP0/1 cover sources outside this server; FM covers the other local
     // ranks. There are no self or unused-lane notifications to wait for.
     const uint32_t starts[6] = {
-        0U, local_end, t.world, t.world + local_end, 2U * t.world + local_begin, 2U * t.world + t.rank + 1U};
-    const uint32_t lengths[6] = {local_begin,         t.world - local_end,  local_begin,
-                                 t.world - local_end, t.rank - local_begin, local_end - t.rank - 1U};
-    const uint32_t expected = 2U * (t.world - (local_end - local_begin)) + local_end - local_begin - 1U;
+        0U, local_end, World, World + local_end, 2U * World + local_begin, 2U * World + t.rank + 1U};
+    const uint32_t lengths[6] = {local_begin,       World - local_end,    local_begin,
+                                 World - local_end, t.rank - local_begin, local_end - t.rank - 1U};
+    const uint32_t expected = 2U * (World - (local_end - local_begin)) + local_end - local_begin - 1U;
     const uint64_t begin = GetSystemCycle();
     // At most 36 batches for supported EP <= 512. A sender cannot overwrite a
     // completed slot until this rank publishes its next descriptor generation.

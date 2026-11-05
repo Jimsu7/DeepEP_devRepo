@@ -46,6 +46,7 @@ setup(
         "LICENSE",
         "third-party/deepseek-deepep.LICENSE",
         "third-party/cann.LICENSE",
+        "third-party/deep_jit/LICENSE",
     ],
     python_requires=">=3.11",
     packages=packages,

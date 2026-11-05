@@ -36,11 +36,12 @@ __aicore__ inline void WaitDispatchGeneration(__gm__ uint64_t* flag, uint64_t ge
     DataSyncBarrier<MemDsbT::DDR>();
 }
 
-__aicore__ inline __gm__ uint64_t* DispatchCompletionFlag(GM_ADDR base, uint32_t world, uint32_t source, uint32_t lane)
+template <uint32_t World>
+__aicore__ inline __gm__ uint64_t* DispatchCompletionFlag(GM_ADDR base, uint32_t source, uint32_t lane)
 {
     // Lane-major slots let AIV7 load consecutive sources with one strided MTE
     // operation. Match the existing 512B packet-tail vector polling layout.
-    return reinterpret_cast<__gm__ uint64_t*>(base + (uint64_t(lane) * world + source) * 512U + 504U);
+    return reinterpret_cast<__gm__ uint64_t*>(base + (uint64_t(lane) * World + source) * 512U + 504U);
 }
 
 __simt_vf__ __launch_bounds__(128) inline void PublishDispatchCompletionVf(__ubuf__ uint64_t* targets, uint32_t count,

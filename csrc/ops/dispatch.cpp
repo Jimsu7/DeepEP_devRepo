@@ -8,7 +8,7 @@
 #include <vector>
 #include <array>
 #include "kernels/dispatch/tiling.hpp"
-#include "kernels/dispatch/launch.hpp"
+#include "kernels/dispatch/jit_launcher.hpp"
 #include "kernels/notify/launch.hpp"
 #include "runtime/session.hpp"
 
@@ -159,6 +159,9 @@ void bind_dispatch(py::module_& module)
         }
         if (!config.peer_table) throw std::invalid_argument("Dispatch requires a prepared peer table");
         py::gil_scoped_release release;
+        // Python has collectively preflighted this specialization. Reuse its
+        // context-local DeepJIT cache before lazy control initialization.
+        const auto prepared = dispatch_jit::prepare(dispatch_jit::spec_for(config, weights != nullptr));
         DevicePhaseTiming timing(measure);
         const Session::DispatchControlLayout controls{t.sync,
                                                       t.inbox,
@@ -200,8 +203,7 @@ void bind_dispatch(py::module_& module)
         timing.mark(0, stream);
         if (benchmark_entry_barrier) notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(1, stream);
-        dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
-                           reinterpret_cast<uint8_t*>(&config));
+        dispatch_jit::launch(prepared, stream, workspace, destinations, forward, counts, weights, scales, config);
         timing.mark(2, stream);
         // The kernel joins incoming completion flags before its stream event.
         if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);

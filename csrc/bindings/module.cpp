@@ -5,19 +5,57 @@
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
-#ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <pybind11/stl.h>
-#endif
 
 #include "ops/notify.hpp"
 #include "ops/dispatch.hpp"
 #include "ops/combine.hpp"
 #include "ops/low_latency.hpp"
+#include "kernels/dispatch/jit_launcher.hpp"
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     module.attr("runtime_protocol") = 1;
+    module.attr("dispatch_jit_enabled") = true;
+    module.def("init_dispatch_jit", &deepep::jit::initialize);
+    module.def(
+        "prepare_dispatch_jit",
+        [](uint32_t world, uint32_t hidden, uint32_t topk, bool fp8, bool with_weights, bool profile) {
+            deepep::dispatch_jit::prepare({world, hidden, topk, fp8, with_weights, profile});
+        },
+        py::arg("world"), py::arg("hidden"), py::arg("topk"), py::arg("fp8"), py::arg("with_weights"),
+        py::arg("profile") = false, py::call_guard<py::gil_scoped_release>());
+    module.def(
+        "dispatch_jit_metrics",
+        [](uint32_t world, uint32_t hidden, uint32_t topk, bool fp8, bool with_weights, bool profile) {
+            deepep::dispatch_jit::Metrics metrics;
+            {
+                py::gil_scoped_release release;
+                metrics = deepep::dispatch_jit::diagnostics({world, hidden, topk, fp8, with_weights, profile});
+            }
+            py::dict result, spec;
+            spec["world"] = world;
+            spec["hidden"] = hidden;
+            spec["topk"] = topk;
+            spec["fp8"] = fp8;
+            spec["with_weights"] = with_weights;
+            spec["profile"] = profile;
+            result["spec"] = spec;
+            result["init_ms"] = metrics.init_ms;
+            result["key_ms"] = metrics.key_ms;
+            result["disk_hit_before"] = metrics.disk_hit_before;
+            result["build_or_disk_lookup_ms"] = metrics.build_or_disk_lookup_ms;
+            result["compile_and_load_ms"] = metrics.compile_and_load_ms;
+            result["memory_compile_hit_us"] = metrics.memory_compile_hit_us;
+            result["handle_reused"] = metrics.handle_reused;
+            result["context_kernel_count"] = metrics.context_kernel_count;
+            result["artifact"] = metrics.artifact;
+            result["key"] = metrics.key;
+            return result;
+        },
+        py::arg("world"), py::arg("hidden"), py::arg("topk"), py::arg("fp8"), py::arg("with_weights"),
+        py::arg("profile") = false);
     module.def("shmem_library_path", []() {
         Dl_info info{};
         if (dladdr(reinterpret_cast<void*>(&aclshmemx_init_attr), &info) == 0 || info.dli_fname == nullptr) {

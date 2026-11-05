@@ -1,10 +1,10 @@
 // Copyright (c) 2026, Lu Lu
+#pragma once
 
 #include "kernel_operator.h"
 #include "shmem.h"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
-#include "launch.hpp"
 #include "../udma_layout.hpp"
 #include "peer_order.hpp"
 #include "scale_pipeline_layout.hpp"
@@ -165,28 +165,24 @@ __aicore__ inline __gm__ uint64_t* GetPeerCompletionFlag(int32_t src_rank, uint3
                                               qp_idx * kPeerSyncFlagBytes);
 }
 
-__aicore__ inline uint32_t GetDispatchGroupWidth(int32_t world_size)
+template <uint32_t World>
+__aicore__ inline uint32_t GetDispatchGroupWidth()
 {
-    return world_size < static_cast<int32_t>(kMaxDispatchGroupWidth) ? static_cast<uint32_t>(world_size)
-                                                                     : kMaxDispatchGroupWidth;
+    return World < static_cast<int32_t>(kMaxDispatchGroupWidth) ? static_cast<uint32_t>(World) : kMaxDispatchGroupWidth;
 }
 
-__aicore__ inline bool UseTwoFrameDispatchSchedule(int32_t world_size)
+template <uint32_t World>
+__aicore__ inline uint32_t GetGroupRankIndex(int32_t rank)
 {
-    return world_size == static_cast<int32_t>(kTwoFrameDispatchWorldSize);
-}
-
-__aicore__ inline uint32_t GetGroupRankIndex(int32_t rank, int32_t world_size)
-{
-    if (UseTwoFrameDispatchSchedule(world_size)) {
+    if constexpr (World == kTwoFrameDispatchWorldSize) {
         const uint32_t local_rank = static_cast<uint32_t>(rank) % kDispatchRanksPerFrame;
         const uint32_t row = local_rank / kDispatchRanksPerDirectRow;
         const uint32_t column = local_rank % kDispatchRanksPerDirectRow;
         return (row % kDispatchGroupRows) * kDispatchGroupColumns + column % kDispatchGroupColumns;
     }
 
-    const int32_t half_world_size = world_size / 2;
-    const uint32_t half_group_width = GetDispatchGroupWidth(world_size) / 2;
+    const int32_t half_world_size = World / 2;
+    const uint32_t half_group_width = GetDispatchGroupWidth<World>() / 2;
     return static_cast<uint32_t>(rank / half_world_size) * half_group_width +
            static_cast<uint32_t>(rank % static_cast<int32_t>(half_group_width));
 }
@@ -279,6 +275,7 @@ __aicore__ inline void PublishPeerCompletionSignal(int32_t dst_rank, int32_t cur
 
 // Each FM owner uses its private QP0. Clos assigns QP0 and QP1 to
 // independent cores; self-copy has no QP.
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
 struct DeepepSecondaryState {
     uint64_t profile = 0;
     uint64_t* detail = nullptr;
@@ -292,16 +289,17 @@ struct DeepepSecondaryState {
     GM_ADDR completion;
     __gm__ uint64_t* book;
     __gm__ uint8_t* sync;
-    uint32_t rank, world, core, lanes, row_bytes;
+    uint32_t rank, core;
     uint64_t magic;
     uint32_t clos_table_owner = 0U;
     uint64_t clos_relay_mailbox = 0U, address_seen[8]{};
 };
 
-__aicore__ inline void CopyDeepepRows(GM_ADDR source, GM_ADDR destination, uint32_t row_bytes,
-                                      AscendC::LocalTensor<int32_t> rows, uint32_t count,
-                                      AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_buffer)
+template <uint32_t RowBytes>
+__aicore__ inline void CopyDeepepRows(GM_ADDR source, GM_ADDR destination, AscendC::LocalTensor<int32_t> rows,
+                                      uint32_t count, AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_buffer)
 {
+    constexpr uint32_t row_bytes = RowBytes;
     const uint32_t stride = ((row_bytes + 31U) / 32U) * 32U;
     const uint32_t fit = stride <= kDuplicateHiddenStageBytes ? kDuplicateHiddenStageBytes / stride : 1U;
     const uint32_t rows_per_tile = fit < kDuplicateMaxPrimaryRows ? fit : kDuplicateMaxPrimaryRows;
@@ -335,11 +333,12 @@ __aicore__ inline void CopyDeepepRows(GM_ADDR source, GM_ADDR destination, uint3
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 }
 
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
 struct DeepepPrimaryState {
     GM_ADDR input;
     GM_ADDR destinations;
-    DeepepSecondaryState* secondary;
-    uint32_t tokens, topk, address_stride;
+    DeepepSecondaryState<World, RowBytes, TopK>* secondary;
+    uint32_t tokens, address_stride;
     uint64_t clos_peer_table = 0, clos_peer_rows = 0, bytes = 0;
     uint64_t fm_context = 0, fm_queue = 0;
     uint32_t fm_slot = 0;
@@ -348,22 +347,22 @@ struct DeepepPrimaryState {
 #include "fm_queue.hpp"
 #include "fm_primary.hpp"
 
-template <bool Profile>
-__aicore__ inline void DispatchDeepepLocalPeer(DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
+template <bool Profile, uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void DispatchDeepepLocalPeer(DeepepPrimaryState<World, RowBytes, TopK>& p, __ubuf__ uint8_t* wqe,
                                                AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots, uint64_t profile)
 {
     auto& s = *p.secondary;
-    if (s.core + 1U >= s.lanes) {
+    if (s.core + 1U >= (World < 8U ? World : 8U)) {
         return;
     }
-    const uint32_t lane = (s.rank % 8U + s.core + 1U) % s.lanes;
+    const uint32_t lane = (s.rank % 8U + s.core + 1U) % (World < 8U ? World : 8U);
     const int32_t peer = s.rank / 8U * 8U + lane;
     {
         auto records = slots.Get<uint32_t>();
         uint32_t begin[2], count[2];
         for (uint32_t phase = 0U; phase < 2U; ++phase) {
             NativeLoad(records,
-                       reinterpret_cast<__gm__ uint32_t*>(p.clos_peer_table + 64U) + (phase * s.world + peer) * 4U, 4U);
+                       reinterpret_cast<__gm__ uint32_t*>(p.clos_peer_table + 64U) + (phase * World + peer) * 4U, 4U);
             begin[phase] = records.GetValue(0U);
             count[phase] = records.GetValue(1U);
         }
@@ -388,21 +387,23 @@ __aicore__ inline void DispatchDeepepLocalPeer(DeepepPrimaryState& p, __ubuf__ u
 
 // <=64P: up to 25 local writers use the unused upper group region.
 // >=128P: 16 Clos owners need the full group region; nine local flags follow FM signals.
-__aicore__ inline __gm__ uint64_t* DeepepLocalPrimaryDone(DeepepSecondaryState& s, uint32_t worker)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline __gm__ uint64_t* DeepepLocalPrimaryDone(DeepepSecondaryState<World, RowBytes, TopK>& s,
+                                                          uint32_t worker)
 {
-    return reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(s.world) * kRankSyncSlotBytes +
-                                              (s.world >= 128U ? 40960U : 16384U) + uint64_t(worker) * 512U);
+    return reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(World) * kRankSyncSlotBytes +
+                                              (World >= 128U ? 40960U : 16384U) + uint64_t(worker) * 512U);
 }
 
-__aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState<World, RowBytes, TopK>& p, __ubuf__ uint8_t* wqe,
                                                AscendC::TBuf<AscendC::QuePosition::VECCALC>& copy,
                                                AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
     auto& s = *p.secondary;
-    const uint32_t worker = s.core - ascend_deepep::scale_clos::LocalFirst(s.world);
+    const uint32_t worker = s.core - ascend_deepep::scale_clos::LocalFirst(World);
     int64_t begin = 0, end = 0;
-    DispatchSplitRange(int64_t(p.tokens) * p.topk, ascend_deepep::scale_clos::LocalWorkers(s.world), worker, begin,
-                       end);
+    DispatchSplitRange(int64_t(p.tokens) * TopK, ascend_deepep::scale_clos::LocalWorkers(World), worker, begin, end);
     auto routes = copy.Get<int64_t>();
     auto rows = copy.Get<int32_t>()[2U * kUdmaScratchRows];
     static_assert(4U * kUdmaScratchRows * sizeof(int32_t) <= kLocalCopyTileBytes);
@@ -416,14 +417,14 @@ __aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState& p, __ubuf__ u
             if (encoded < 0 || uint64_t(encoded) / p.address_stride != s.rank) {
                 continue;
             }
-            rows.SetValue(count * 2U, (first + i) / p.topk);
+            rows.SetValue(count * 2U, (first + i) / TopK);
             rows.SetValue(count * 2U + 1U, uint64_t(encoded) % p.address_stride);
             ++count;
         }
         if (!count) {
             continue;
         }
-        CopyDeepepRows(p.input, s.hidden, s.row_bytes, rows, count, slots);
+        CopyDeepepRows<RowBytes>(p.input, s.hidden, rows, count, slots);
     }
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
     auto* done = DeepepLocalPrimaryDone(s, worker);
@@ -433,10 +434,10 @@ __aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState& p, __ubuf__ u
     // Other writers need not wait for worker0; each has drained its own copy.
     // Self expansion starts only after every active writer has published done.
     if (worker == 0U) {
-        for (uint32_t i = 0; i < ascend_deepep::scale_clos::LocalWorkers(s.world); ++i) {
+        for (uint32_t i = 0; i < ascend_deepep::scale_clos::LocalWorkers(World); ++i) {
             aclshmem_uint64_wait_until(DeepepLocalPrimaryDone(s, i), ACLSHMEM_CMP_EQ, s.magic);
         }
-        PublishPeerCompletionSignal(s.rank, s.rank, GetGroupRankIndex(s.rank, s.world), 1U, s.sync, wqe);
+        PublishPeerCompletionSignal(s.rank, s.rank, GetGroupRankIndex<World>(s.rank), 1U, s.sync, wqe);
     }
 }
 
@@ -460,10 +461,11 @@ using ascend_deepep::DispatchTiling;
 
 #include "fm_forward.hpp"
 
-template <bool Profile>
-__aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts,
-                                GM_ADDR weights, GM_ADDR scales, const DispatchTiling& t)
+template <uint32_t World, uint32_t Hidden, uint32_t TopK, bool Fp8, bool WithWeights, bool Profile>
+__aicore__ inline void DispatchImpl(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts,
+                                    GM_ADDR weights, GM_ADDR scales, const DispatchTiling& t)
 {
+    constexpr uint32_t RowBytes = Hidden * (Fp8 ? 1U : 2U);
     const uint32_t core = GetBlockIdx(), cores = 64U;
     const uint64_t profile = t.profile + uint64_t(core) * 256U;
     DispatchDetail<Profile> detail;
@@ -484,28 +486,28 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
     DispatchProfileMark<Profile>(profile, 1U);
     // Peer generation/address handshakes gate consumers; no entry collective.
     DispatchProfileMark<Profile>(profile, 2U);
-    if (core >= 16U && core - 16U < GetDispatchGroupWidth(t.world)) {
+    if (core >= 16U && core - 16U < GetDispatchGroupWidth<World>()) {
         InitializeTokenScatterPeerSignals(t.rank, core - 16U, t.generation, 2U, sync);
     }
-    PublishPeerAddresses(workspace, t, copy, slots);
+    PublishPeerAddresses<World, Fp8>(workspace, t, copy, slots);
     DispatchProfileMark<Profile>(profile, 3U);
     if (core >= 32U) {
-        if (weights) {
+        if constexpr (WithWeights) {
             PeerAuxPlan plan{destinations, weights, reinterpret_cast<GM_ADDR>(t.output_weights_address),
                              t.address_stride};
-            DispatchAuxPipeline::Run<Profile>(workspace, t, plan, slots, copy, wqe_buffer);
+            DispatchAuxPipeline::Run<Profile, World, TopK>(workspace, t, plan, slots, copy, wqe_buffer);
         }
         // Independent inboxes, metadata, ready publication and local expansion.
         // Weight completion drains its UB/events before scale reuses the scratch.
         DispatchProfileMark<Profile>(profile, 31U);
-        if (t.fp8) {
-            PeerScales<Profile>(workspace, scales, destinations, t, copy, slots, wqe_buffer);
+        if constexpr (Fp8) {
+            PeerScales<Profile, World, Hidden, TopK>(workspace, scales, destinations, t, copy, slots, wqe_buffer);
         }
         // Auxiliary workers remain independent of hidden local expansion.
         DispatchProfileMark<Profile>(profile, 4U);
         DispatchProfileMark<Profile>(profile, 5U);
     } else {
-        DeepepSecondaryState s{};
+        DeepepSecondaryState<World, RowBytes, TopK> s{};
         if constexpr (Profile) {
             s.profile = profile;
             s.detail = detail.data();
@@ -517,29 +519,25 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         s.book = book;
         s.sync = sync;
         s.rank = t.rank;
-        s.world = t.world;
         s.core = core;
-        s.lanes = t.world < 8U ? t.world : 8U;
-        s.row_bytes = t.hidden * (t.fp8 ? 1U : 2U);
         s.magic = t.generation;
         s.clos_relay_mailbox = t.peer_table + t.plan_mailbox_offset;
-        DeepepPrimaryState p{};
+        DeepepPrimaryState<World, RowBytes, TopK> p{};
         p.input = reinterpret_cast<GM_ADDR>(t.input_address);
         p.destinations = destinations;
         p.secondary = &s;
         p.tokens = t.tokens;
-        p.topk = t.topk;
         p.address_stride = t.address_stride;
         p.clos_peer_table = t.peer_table;
         p.clos_peer_rows = t.peer_table + t.plan_rows_offset;
-        const uint32_t local_first = ascend_deepep::scale_clos::LocalFirst(t.world);
-        if (core == 7U && t.world != 8U) {
-            if (t.world > 8U) RunClosRelayAssist<Profile>(s, copy);
+        const uint32_t local_first = ascend_deepep::scale_clos::LocalFirst(World);
+        if (core == 7U && World != 8U) {
+            if constexpr (World > 8U) RunClosRelayAssist<Profile>(s, copy);
         } else if (core >= 8U && core < local_first) {
-            if (t.world > 8U) DispatchClosSplitQp<Profile>(p, wqe, copy, slots);
+            if constexpr (World > 8U) DispatchClosSplitQp<Profile>(p, wqe, copy, slots);
         } else if (core < 7U) {
-            if (core + 1U < s.lanes) {
-                const uint32_t peer = t.rank / 8U * 8U + (t.rank % 8U + core + 1U) % s.lanes;
+            if (core + 1U < (World < 8U ? World : 8U)) {
+                const uint32_t peer = t.rank / 8U * 8U + (t.rank % 8U + core + 1U) % (World < 8U ? World : 8U);
                 EnsureDeepepPeerAddress(s, peer);
             }
             DispatchDeepepLocalPeer<Profile>(p, wqe, slots, profile);
@@ -560,7 +558,7 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
     // the stream event can release a consumer. No collective barrier kernel.
     DispatchProfileMark<Profile>(profile, 6U);
     DrainDispatchStores<Profile>(t, detail.data());
-    WaitDispatchIncoming(workspace, t, wqe_buffer);
+    WaitDispatchIncoming<World>(workspace, t, wqe_buffer);
     DispatchProfileMark<Profile>(profile, 7U);
     if constexpr (Profile) {
         if (t.detail_profile) {
@@ -572,8 +570,8 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
             d[21] = t.rank;
             d[22] = core;
             d[23] = 2U;
-            d[28] = t.world;
-            d[29] = ascend_deepep::scale_clos::Qp1Workers(t.world);
+            d[28] = World;
+            d[29] = ascend_deepep::scale_clos::Qp1Workers(World);
             auto* output = reinterpret_cast<__gm__ uint64_t*>(t.detail_profile) + uint64_t(core) * 32U;
             for (uint32_t i = 0; i < 32U; ++i) output[i] = d[i];
             dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(output), 256U);
@@ -591,38 +589,19 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
 #endif
 }  // namespace
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_kernel(GM_ADDR workspace,
-                                                                                    GM_ADDR destinations,
-                                                                                    GM_ADDR forward, GM_ADDR counts,
-                                                                                    GM_ADDR weights, GM_ADDR scales,
-                                                                                    ascend_deepep::DispatchTiling t)
-{
-    util_set_ffts_config(0U);
+namespace ascend_deepep {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Dispatch<false>(workspace, destinations, forward, counts, weights, scales, t);
-#endif
-}
-
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_profile_kernel(
-    GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts, GM_ADDR weights, GM_ADDR scales,
-    ascend_deepep::DispatchTiling t)
+template <uint32_t World, uint32_t Hidden, uint32_t TopK, bool Fp8, bool WithWeights, bool Profile>
+__aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts,
+                                GM_ADDR weights, GM_ADDR scales, const DispatchTiling& runtime)
 {
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Dispatch<true>(workspace, destinations, forward, counts, weights, scales, t);
+    static_assert(World >= 2U && World <= kMaxDispatchRanks && (World & (World - 1U)) == 0U,
+                  "dispatch requires a power-of-two world in [2,512]");
+    static_assert(Hidden > 0U && Hidden <= 7168U && Hidden % (Fp8 ? 128U : 16U) == 0U,
+                  "invalid HT hidden size or alignment");
+    static_assert(TopK >= 1U && TopK <= 16U, "HT dispatch top-k must be in [1,16]");
+    DispatchImpl<World, Hidden, TopK, Fp8, WithWeights, Profile>(workspace, destinations, forward, counts, weights,
+                                                                 scales, runtime);
+}
 #endif
-}
-
-extern "C" ASCEND_DEEPEP_EXPORT void dispatch_kernel_do(void* stream, uint8_t* workspace, uint8_t* destinations,
-                                                        uint8_t* forward, uint8_t* counts, uint8_t* weights,
-                                                        uint8_t* scales, uint8_t* tiling)
-{
-    const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
-    if (t.profile) {
-        dispatch_profile_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(
-            workspace, destinations, forward, counts, weights, scales, t);
-        return;
-    }
-    dispatch_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(workspace, destinations, forward,
-                                                                                counts, weights, scales, t);
-}
+}  // namespace ascend_deepep

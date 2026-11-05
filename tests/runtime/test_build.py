@@ -5,9 +5,10 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import zipfile
 
 import pytest
@@ -81,12 +82,19 @@ def load(path):
 def build(monkeypatch):
     module = load(ROOT / "build_support.py")
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
-    from types import SimpleNamespace
-
+    # Configuration-only tests do not load real framework/device libraries.
     monkeypatch.setitem(
-        sys.modules, "torch", SimpleNamespace(__version__="build-test", _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True))
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            __version__="test-torch",
+            __file__="/fake/torch/__init__.py",
+            _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True),
+        ),
     )
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="build-test"))
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(__version__="test-torch-npu", __file__="/fake/torch_npu/__init__.py")
+    )
     return module
 
 
@@ -159,6 +167,7 @@ def test_sdk_identity_and_cann_version(build, monkeypatch, tmp_path, fault, vers
     source.mkdir()
     (source / "dependencies.lock.json").write_text(json.dumps(lock))
     (source / "VERSION").write_text("test")
+    shutil.copytree(ROOT / "third-party/deep_jit", source / "third-party/deep_jit")
     monkeypatch.setattr(build, "ROOT", source)
     monkeypatch.setattr(build, "source_fingerprint", lambda: "test")
     monkeypatch.setattr(build, "find_host_compiler", lambda env: (sys.executable, b"test"))
@@ -388,6 +397,39 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
+def test_mandatory_dispatch_dependencies_track_headers_framework_and_abi(build, monkeypatch, tmp_path):
+    dependency = tmp_path / "third-party/deep_jit"
+    header = dependency / "include/deep_jit/backend/ascend/backend.hpp"
+    header.parent.mkdir(parents=True)
+    header.write_bytes(b"initial device backend")
+    (dependency / "REVISION").write_text("pinned-revision")
+    monkeypatch.setattr(build, "ROOT", tmp_path)
+    identity, paths = build.dispatch_jit_configuration()
+    assert identity["revision"] == "pinned-revision"
+    assert identity["torch"] == "test-torch" and identity["torch_npu"] == "test-torch-npu"
+    assert identity["torch_cxx11_abi"] is True
+    assert "enabled" not in identity
+    assert set(paths) == {"Torch_DIR", "TORCH_NPU_PATH"}
+    key = build.build_cache_key({"dispatch_jit": identity})
+    header.write_bytes(b"changed device backend")
+    changed, _ = build.dispatch_jit_configuration()
+    assert changed["headers"] != identity["headers"]
+    assert build.build_cache_key({"dispatch_jit": changed}) != key
+    monkeypatch.setattr(sys.modules["torch"]._C, "_GLIBCXX_USE_CXX11_ABI", False)
+    different_abi, _ = build.dispatch_jit_configuration()
+    assert different_abi["torch_cxx11_abi"] is False
+    assert build.build_cache_key({"dispatch_jit": different_abi}) != build.build_cache_key({"dispatch_jit": changed})
+
+
+def test_dispatch_build_requires_framework_and_vendored_sources(build, monkeypatch, tmp_path):
+    monkeypatch.setattr(build, "ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="vendored DeepJIT"):
+        build.dispatch_jit_configuration()
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
+    with pytest.raises(RuntimeError, match="require torch and torch_npu"):
+        build.dispatch_jit_configuration()
+
+
 @pytest.fixture
 def source_native(build, monkeypatch, tmp_path):
     source = tmp_path / "checkout"
@@ -409,6 +451,14 @@ def source_native(build, monkeypatch, tmp_path):
     (destination / ".libs").mkdir()
     for name in build.SHMEM_RUNTIME_LIBRARIES:
         (destination / ".libs" / name).write_bytes(b"SDK")
+    for name in ("kernels/dispatch/dispatch_impl.hpp", "kernels/dispatch/tiling.hpp", "DeepJIT.LICENSE"):
+        path = destination / "jit" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(("first:" + name).encode())
+        if name.startswith("kernels/"):
+            canonical = source / "csrc" / name
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_bytes(path.read_bytes())
     return package, destination, names
 
 
@@ -420,14 +470,35 @@ def test_source_native_snapshot_survives_staging_removal_and_refresh(build, sour
         assert (package / name).is_symlink()
         assert (package / name).read_bytes() == (destination / name).read_bytes()
         (destination / name).write_bytes(b"second")
+    assert (package / "jit").is_symlink()
+    jit_files = [path.relative_to(destination) for path in (destination / "jit").rglob("*") if path.is_file()]
+    for name in jit_files:
+        assert (package / name).read_bytes() == (destination / name).read_bytes()
+        (destination / name).write_bytes(b"second JIT")
     # The first complete build is not changed by staging a second one.
     assert (package / names[0]).read_bytes().startswith(b"first:")
+    assert all((package / name).read_bytes().startswith(b"first:") for name in jit_files)
     build.publish_source_native(destination)
     assert (package / ".native-build").resolve() != first
     build.shutil.rmtree(destination)
     assert all((package / name).read_bytes() == b"second" for name in names)
     assert (package / ".libs").is_symlink()
     assert all((package / ".libs" / name).read_bytes() == b"SDK" for name in build.SHMEM_RUNTIME_LIBRARIES)
+    assert all((package / name).read_bytes() == b"second JIT" for name in jit_files)
+
+
+@pytest.mark.parametrize(
+    "missing", ["kernels/dispatch/dispatch_impl.hpp", "kernels/dispatch/tiling.hpp", "DeepJIT.LICENSE"]
+)
+def test_incomplete_jit_payload_keeps_previous_source_build(build, source_native, missing):
+    package, destination, _ = source_native
+    build.publish_source_native(destination)
+    first = (package / ".native-build").readlink()
+    (destination / "jit" / missing).unlink()
+    with pytest.raises(RuntimeError, match="Incomplete native build"):
+        build.publish_source_native(destination)
+    assert (package / ".native-build").readlink() == first
+    assert (package / "jit" / missing).read_bytes().startswith(b"first:")
 
 
 @pytest.mark.parametrize("missing", [None, "libshmem_utils.so", "aclshmem_bootstrap_uid.so"])
@@ -557,6 +628,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
         "build_type": "RelWithDebInfo",
         "python_executable": "/private/python",
         "build_environment": {"CXXFLAGS": "-I/private/include"},
+        "dispatch_jit": {"revision": "pinned-deepjit", "headers": {"runtime.hpp": "sha256"}},
+        "dispatch_jit_paths": {"Torch_DIR": "/private/torch/cmake", "TORCH_NPU_PATH": "/private/torch_npu"},
     }
     monkeypatch.setattr(build, "build_configuration", lambda: configuration)
     monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "6")
@@ -601,6 +674,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert published == ([] if inplace else [destination.resolve()])
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
+    assert "-DTorch_DIR=/private/torch/cmake" in calls[0]
+    assert "-DTORCH_NPU_PATH=/private/torch_npu" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
@@ -610,6 +685,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
+    assert info["dispatch_jit"] == configuration["dispatch_jit"]
+    assert "dispatch_jit_paths" not in info
     assert info["megamoe"] == {"enabled": beta, "timer": timer}
     assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
@@ -642,6 +719,7 @@ def test_compiler_symlink_keeps_invocation_name(build, monkeypatch, tmp_path):
     source.mkdir()
     (source / "dependencies.lock.json").write_text(json.dumps(lock))
     (source / "VERSION").write_text((ROOT / "VERSION").read_text())
+    shutil.copytree(ROOT / "third-party/deep_jit", source / "third-party/deep_jit")
     monkeypatch.setattr(build, "ROOT", source)
     manifest = {
         "revision": lock["shmem"]["revision"],
