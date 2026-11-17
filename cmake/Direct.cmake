@@ -17,19 +17,29 @@ find_library(_tiling NAMES tiling_api PATHS "${ASCEND_HOME_PATH}/lib64" REQUIRED
 find_library(_platform NAMES platform PATHS "${ASCEND_HOME_PATH}/lib64" REQUIRED)
 
 set(_direct_root "${CMAKE_SOURCE_DIR}/csrc/direct")
+# Keep the Host tiling ABI tied to the exact header installed for Device JIT.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_direct_root}/common/types.h")
+file(SHA256 "${_direct_root}/common/types.h" _direct_types_sha256)
 pybind11_add_module(_clos_C NO_EXTRAS
     "${_direct_root}/bindings/pybind.cpp" "${_direct_root}/bindings/torch_classes.cpp"
     "${_direct_root}/ops/launcher.cpp" "${_direct_root}/runtime/shmem_instance.cpp"
     "${_direct_root}/runtime/buffer_runtime.cpp"
     "${_direct_root}/ops/aggregate.cpp" "${_direct_root}/ops/combine.cpp"
-    "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp")
+    "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp"
+    "${_direct_root}/jit/runtime.cpp")
+
+set_target_properties(_clos_C PROPERTIES CXX_STANDARD 20)
 target_include_directories(_clos_C PRIVATE "${_direct_root}"
     ${TORCH_INCLUDE_DIRS} "${_torch_npu_root}/include" "${_torch_npu_root}/.."
+    "${_torch_npu_root}/include/third_party/acl/inc"
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/include/experiment/runtime"
-    "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src")
+    "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src"
+    "${CMAKE_SOURCE_DIR}/third-party/deep_jit/include")
 target_compile_definitions(_clos_C PRIVATE TORCH_EXTENSION_NAME=_clos_C
-    _GLIBCXX_USE_CXX11_ABI=${_torch_abi} ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64)
-target_compile_options(_clos_C PRIVATE -O2)
+    _GLIBCXX_USE_CXX11_ABI=${_torch_abi} ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64
+    DJ_DISABLE_GIL=1 DEEPEP_DIRECT_TYPES_SHA256="${_direct_types_sha256}")
+target_compile_options(_clos_C PRIVATE -O2 -Wno-missing-field-initializers
+    -Wno-attributes -Wno-deprecated-declarations -Wno-unused-function)
 target_link_libraries(_clos_C PRIVATE ${TORCH_LIBRARIES} "${_torch_python}" "${_torch_npu}"
     ascendcl ascend_runtime shmem deepep_clos_device "${_tiling}" "${_platform}" ${CMAKE_DL_LIBS})
 set_target_properties(_clos_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)

@@ -8,8 +8,10 @@
 // Local: MTE ping-pong, never interpreted as a remote address.
 // Both own-source and received-source expansion use the same MTE double buffer.
 // The caller acquires the appropriate source-ready flag before entering here.
-__aicore__ inline void CopyLocalForwardRecords(DeepepSecondaryState& s, uint32_t count, LocalTensor<uint32_t> records,
-                                               TBuf<QuePosition::VECCALC>& staging, uint32_t& stage)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void CopyLocalForwardRecords(DeepepSecondaryState<World, RowBytes, TopK>& s, uint32_t count,
+                                               LocalTensor<uint32_t> records, TBuf<QuePosition::VECCALC>& staging,
+                                               uint32_t& stage)
 {
     for (uint32_t row = 0; row < count; row += 4U) {
         const uint32_t n = count - row < 4U ? count - row : 4U;
@@ -26,13 +28,13 @@ __aicore__ inline void CopyLocalForwardRecords(DeepepSecondaryState& s, uint32_t
                     break;
                 }
             if (source_slot[i] == i)
-                IssueGmBytesToUb(ub[i * s.row_bytes], s.hidden + uint64_t(primary) * s.row_bytes, s.row_bytes);
+                IssueGmBytesToUb(ub[i * RowBytes], s.hidden + uint64_t(primary) * RowBytes, RowBytes);
         }
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         for (uint32_t i = 0; i < n; ++i)
-            IssueUbBytesToGm(s.hidden + uint64_t(records.GetValue((row + i) * 2U + 1U)) * s.row_bytes,
-                             ub[source_slot[i] * s.row_bytes], s.row_bytes);
+            IssueUbBytesToGm(s.hidden + uint64_t(records.GetValue((row + i) * 2U + 1U)) * RowBytes,
+                             ub[source_slot[i] * RowBytes], RowBytes);
         SetFlag<HardEvent::MTE3_MTE2>(event);
         stage ^= 1U;
     }
@@ -134,26 +136,26 @@ __simt_vf__ __launch_bounds__(128) inline void CarryForwardPairsVf(__ubuf__ uint
 // source need not publish an early SO; waiting on every forward_counts entry
 // would deadlock. A parked source remembers its tile and is not rescanned
 // while its ready flag remains absent.
-template <bool Profile, bool Local>
-__aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling& t, GM_ADDR forward, GM_ADDR counts,
-                                   TBuf<QuePosition::VECCALC>& metadata, TBuf<QuePosition::VECCALC>& staging,
-                                   __ubuf__ uint8_t* wqe)
+template <bool Profile, bool Local, uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void ForwardPeer(DeepepSecondaryState<World, RowBytes, TopK>& s, const DispatchTiling& t,
+                                   GM_ADDR forward, GM_ADDR counts, TBuf<QuePosition::VECCALC>& metadata,
+                                   TBuf<QuePosition::VECCALC>& staging, __ubuf__ uint8_t* wqe)
 {
     if constexpr (!Local) {
-        if (s.core + 1U >= s.lanes) return;
+        if (s.core + 1U >= (World < 8U ? World : 8U)) return;
     }
-    const uint32_t lane = Local ? s.rank % 8U : (s.rank % 8U + s.core + 1U) % s.lanes;
+    const uint32_t lane = Local ? s.rank % 8U : (s.rank % 8U + s.core + 1U) % (World < 8U ? World : 8U);
     const uint32_t peer = s.rank / 8U * 8U + lane;
-    const uint32_t capacity = t.tokens * t.topk;
+    const uint32_t capacity = t.tokens * TopK;
     const uint64_t profile = t.profile + uint64_t(s.core) * 256U;
-    auto cursors = metadata.GetWithOffset<uint32_t>(s.world, 14336U);
-    auto ends = metadata.GetWithOffset<uint32_t>(s.world, 12288U);
+    auto cursors = metadata.GetWithOffset<uint32_t>(World, 14336U);
+    auto ends = metadata.GetWithOffset<uint32_t>(World, 12288U);
     auto records = metadata.Get<uint32_t>();
     auto accumulated = metadata.GetWithOffset<uint32_t>(320U, 1024U);
     uint32_t carried = 0U;
-    NativeLoad(ends, reinterpret_cast<__gm__ uint32_t*>(counts), s.world);
+    NativeLoad(ends, reinterpret_cast<__gm__ uint32_t*>(counts), World);
     uint32_t seen[16]{}, parked[16]{};
-    for (uint32_t source = 0U; source < s.world; ++source) {
+    for (uint32_t source = 0U; source < World; ++source) {
         const int32_t count = int32_t(ends.GetValue(source));
         if (count < 0 || uint32_t(count) > capacity) {
             aclshmemi_kernel_abort("FM invalid forward count");
@@ -165,7 +167,7 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
             // Rotate raw-row partitions across sources; every public record has
             // exactly one local reader. Filtering never changes Combine's table.
             const uint32_t base = source * capacity;
-            ascend_deepep::scale_clos::SplitLocalForwardRange(s.world, s.core, base, base + last, first, last);
+            ascend_deepep::scale_clos::SplitLocalForwardRange(World, s.core, base, base + last, first, last);
             first -= base;
             last -= base;
         } else {
@@ -198,12 +200,12 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
         bool pending = false, progress = false;
         // Local expansion visits its own original source first. Sources after
         // that remain independent: an absent SO never blocks another source.
-        for (uint32_t visit = 0U; visit < s.world; ++visit) {
-            const uint32_t source = Local ? (s.rank + visit) % s.world : visit;
+        for (uint32_t visit = 0U; visit < World; ++visit) {
+            const uint32_t source = Local ? (s.rank + visit) % World : visit;
             const uint32_t bit = 1U << (source % 32U), word = source / 32U;
             if (seen[word] & bit) continue;
             pending = true;
-            bool ready = IsSourceReadyForForwarding(source, GetGroupRankIndex(s.rank, s.world), s.magic, 2U, s.sync);
+            bool ready = IsSourceReadyForForwarding(source, GetGroupRankIndex<World>(s.rank), s.magic, 2U, s.sync);
             if ((parked[word] & bit) && !ready) continue;
             uint32_t at = cursors.GetValue(source), end = ends.GetValue(source);
             ForwardMetadataCache cache{metadata.GetWithOffset<int32_t>(2U * 128U * 6U, 4416U),
@@ -316,7 +318,7 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
         // Publish separately from ready/checkpoint SO sinks; one peer uses UB.
         auto targets = metadata.Get<uint64_t>();
         targets.SetValue(0U, reinterpret_cast<uint64_t>(
-                                 aclshmem_ptr(DispatchCompletionFlag(s.completion, s.world, s.rank, 2U), peer)));
+                                 aclshmem_ptr(DispatchCompletionFlag<World>(s.completion, s.rank, 2U), peer)));
         PublishDispatchCompletionTargets(targets, 1U, s.magic, metadata.GetWithOffset<uint64_t>(4U, 1024U));
         DispatchProfileMark<Profile>(profile, 10U);
         if constexpr (Profile) {

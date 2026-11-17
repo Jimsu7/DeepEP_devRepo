@@ -124,6 +124,44 @@ def inspect_wheel(path):
                 raise RuntimeError("Kernel capabilities require their packaged Device library")
         if "deep_ep/libdeepep_notify.so" in names:
             raise RuntimeError("Wheel contains a stale libdeepep_notify.so; rebuild the package")
+        direct_jit = [
+            info.get("machine_backends", {}).get(backend, {}).get("device_jit")
+            for backend in ("mesh_pcie", "global_clos")
+        ]
+        if any(direct_jit):
+            expected_jit = {"schema": 2, "scope": "dispatch", "source_root": "jit/direct"}
+            if any(entry != expected_jit for entry in direct_jit):
+                raise RuntimeError("Invalid Direct Device JIT metadata")
+            if "deep_ep/libdeepep_clos_kernels.so" not in names or any(
+                info["machine_backends"][backend].get("device_library") != "libdeepep_clos_kernels.so"
+                for backend in ("mesh_pcie", "global_clos")
+            ):
+                raise RuntimeError("Direct AOT operators require their packaged Device library")
+            if len([n for n in names if n.startswith("deep_ep/_clos_C.") and n.endswith(".so")]) != 1:
+                raise RuntimeError("Direct Device JIT requires exactly one Host extension")
+            sources = info.get("jit_sources", {})
+            required_sources = {
+                "DeepJIT.LICENSE",
+                "direct/common/types.h",
+                "direct/common/launch.h",
+                "direct/kernels/dispatch/dispatch.cpp",
+                "direct/kernels/dispatch/dispatch_udma.cpp",
+                "direct/kernels/common/udma_shared_sender.h",
+                "direct/kernels/dispatch/udma_dispatch_sender.h",
+            }
+            if not isinstance(sources, dict) or not required_sources.issubset(sources):
+                raise RuntimeError("Incomplete Direct Device JIT source manifest")
+            packaged = {
+                n.removeprefix("deep_ep/jit/") for n in names if n.startswith("deep_ep/jit/") and not n.endswith("/")
+            }
+            if packaged != set(sources):
+                raise RuntimeError("Device JIT source payload differs from its manifest")
+            direct_cpp = {name for name in sources if name.startswith("direct/") and name.endswith(".cpp")}
+            if direct_cpp != {"direct/kernels/dispatch/dispatch.cpp", "direct/kernels/dispatch/dispatch_udma.cpp"}:
+                raise RuntimeError("Direct Device JIT must package only payload Dispatch entry sources")
+            for name, digest in sources.items():
+                if hashlib.sha256(archive.read("deep_ep/jit/" + name)).hexdigest() != digest:
+                    raise RuntimeError(f"Corrupt Device JIT source: {name}")
         operations = info.get("communication_operations")
         known = {
             "Buffer.get_dispatch_layout",

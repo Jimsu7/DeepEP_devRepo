@@ -676,9 +676,16 @@ def _host_elastic_buffer(monkeypatch):
         ),
         combine_ep8_mte_version=lambda: 2,
     )
+    monkeypatch.setattr(elastic, "require_native", lambda _: native)
     for module in (elastic, event):
-        monkeypatch.setattr(module, "require_native", lambda _: native)
         monkeypatch.setattr(module, "npu_api", lambda: npu)
+    from deep_ep import _jit
+
+    monkeypatch.setattr(
+        _jit,
+        "prepare",
+        lambda *spec: calls.update(["jit_prepare"]),
+    )
     buffer = elastic.ElasticBuffer.__new__(elastic.ElasticBuffer)
     buffer.hidden = 0
     buffer.num_max_tokens_per_rank, buffer.num_topk = 16, 1
@@ -708,9 +715,17 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
     torch = pytest.importorskip("torch")
     import torch.distributed as dist
 
-    monkeypatch.setattr(dist, "all_gather", lambda *a, **kw: pytest.fail("Unexpected HT preflight collective"))
     buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
     buffer._runtime.group = object()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def gather(peers, local, **kwargs):
+        calls["jit_preflight"] += 1
+        with torch.inference_mode(False):
+            for peer in peers:
+                peer.copy_(local)
+
+    monkeypatch.setattr(dist, "all_gather", gather)
     with torch.inference_mode():
         x, indices = tensor((2, 7168), torch.bfloat16), tensor((2, 1), torch.int64)
         recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=2)
@@ -722,6 +737,7 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
             assert handle._routing_versions[name] == (value.data_ptr(), value._version)
         assert calls["cpu"] == 1
         assert calls["sync"] == 0
+        assert calls["jit_prepare"] == 1 and calls["jit_preflight"] == 2
         assert handle.address_stride == 2 and handle._gather_stride == 1
         calls.clear()
         for cpu_sync in (None, False, True):
@@ -729,6 +745,7 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
             buffer.dispatch(x, handle=handle, do_cpu_sync=cpu_sync, async_with_compute_stream=True)
         assert calls["combine"] == calls["dispatch"] == 3
         assert calls["cpu"] == calls["sync"] == calls["notify"] == 0
+        assert calls["jit_prepare"] == 3 and calls["jit_preflight"] == 6
         assert calls["combine_layout"] == 1 and calls["dispatch_layout"] == 0
         assert calls["event_wait"] and calls["record_stream"]
         handle.forward_counts.add_(1)
@@ -737,6 +754,112 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
         with pytest.raises(ValueError, match="Cached routing was modified"):
             buffer.dispatch(x, handle=handle)
         assert calls["combine"] == calls["dispatch"] == 3
+
+
+def test_dispatch_preserves_legacy_hints_and_six_field_preparation(monkeypatch):
+    import pytest
+    from deep_ep import _jit
+    from deep_ep.backends.mesh_clos import elastic
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    native = elastic.require_native("fixed-64 regression")
+    launches, prepared = [], []
+
+    def launch(session, tensors, *args):
+        assert "dispatch_schedule_id" not in tensors and "dispatch_num_blocks" not in tensors
+        launches.append(args)
+
+    monkeypatch.setattr(native, "dispatch", launch)
+    monkeypatch.setattr(_jit, "prepare", lambda module, *args: prepared.append(args))
+    buffer._dispatch_diagnostics = dict(kernel_timing=False)
+    indices = tensor((2, 1), torch.int64)
+    handle = None
+    for fp8 in (False, True, False):
+        x = tensor((2, 128), torch.float8_e4m3fn if fp8 else torch.bfloat16)
+        if fp8:
+            x = (x, tensor((2, 1), torch.float32))
+        _, _, _, handle, _ = buffer.dispatch(
+            x,
+            handle=handle,
+            topk_idx=indices if handle is None else None,
+            num_experts=2,
+            num_compute_units=64 if fp8 else 32,
+            async_with_compute_stream=True,
+        )
+        # These are the original public compatibility hints, not the physical
+        # block count of the fixed-64 Mesh/Clos kernel.
+        assert handle.num_compute_units == (64 if fp8 else 32)
+        assert not hasattr(handle, "dispatch_schedule_id") and not hasattr(handle, "dispatch_schedule")
+        assert not {"schedule_id", "schedule", "num_blocks"} & buffer._dispatch_diagnostics.keys()
+    assert prepared == [(2, 128, 1, fp8, False, False) for fp8 in (False, True, False)]
+    assert len(launches) == 3
+    assert calls["notify"] == 1 and calls["sync"] == 0
+
+
+def test_dispatch_rejects_cross_rank_profile_or_return_plan_mismatch_before_payload(monkeypatch):
+    import pytest
+    from deep_ep import _jit
+
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    buffer._runtime.group = object()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+    monkeypatch.setattr(_jit, "prepare", lambda *args: None)
+    x, indices = tensor((2, 128), torch.bfloat16), tensor((2, 1), torch.int64)
+    for mismatch in (16, 17):  # Four control fields, then Profile and dedup mode at signature[12:14].
+        records = []
+
+        def gather(peers, local, **kwargs):
+            records.append(local.tolist())
+            for peer in peers:
+                peer.copy_(local)
+            if local[1] == 1 and local[2] == 1:
+                peers[1][mismatch] += 1
+
+        monkeypatch.setattr(dist, "all_gather", gather)
+        with pytest.raises(ValueError, match="ranks disagree"):
+            buffer.dispatch(x, topk_idx=indices, num_experts=2, async_with_compute_stream=True)
+        assert records[-1][3] == 14
+        assert records[-1][16:18] == [0, 8]
+        assert len(records[-1]) == 18  # Original four control + fourteen signature fields.
+        assert calls["dispatch"] == 0 and calls["sync"] == 0
+
+
+def test_jit_prepare_failure_stops_public_mesh_dispatch(monkeypatch):
+    """The relocated backend must preflight compile errors before payload launch."""
+    import pytest
+    import deep_ep
+    from deep_ep import _jit
+
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    # Use the public entry's inherited operation after Mesh+Clos selection.
+    public = deep_ep.ElasticBuffer.__new__(deep_ep.ElasticBuffer)
+    public.__dict__.update(buffer.__dict__)
+    public._runtime.group = object()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def gather(peers, local, **kwargs):
+        calls["jit_preflight"] += 1
+        for peer in peers:
+            peer.copy_(local)
+
+    def fail_prepare(*args):
+        calls["jit_prepare"] += 1
+        raise RuntimeError("simulated compiler failure")
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    monkeypatch.setattr(_jit, "prepare", fail_prepare)
+    x, indices = tensor((2, 128), torch.bfloat16), tensor((2, 1), torch.int64)
+    with pytest.raises(ValueError, match="simulated compiler failure"):
+        public.dispatch(x, topk_idx=indices, num_experts=2)
+    assert calls["jit_prepare"] == 1 and calls["jit_preflight"] == 2
+    assert calls["notify"] == 1 and calls["dispatch"] == 0
 
 
 def test_dispatch_benchmark_flags_and_restore(monkeypatch):
@@ -975,9 +1098,10 @@ void asc_threadfence() {}
         + expand
         + r"""
 
-int main()
+template <unsigned words>
+void check()
 {
-    for (unsigned words = 1; words <= 56; ++words) {
+    {
         std::vector<uint32_t> packed(3 * 128, 0xdeadbeef), errors(128, 0);
         auto* slots = reinterpret_cast<int32_t*>(packed.data());
         const int32_t targets[] = {2, 0, 1, -1, 3, -1};
@@ -992,19 +1116,26 @@ int main()
                 for (unsigned col = 0; col < words; ++col)
                     expected[8 + targets[row] * words + col] = (row + 1) * 1000 + col;
         for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x)
-            Expand(packed.data(), slots, output.data() + 8, 6, words, 56, 4, errors.data());
+            Expand<words * 128U>(packed.data(), slots, output.data() + 8, 6, 56, 4, errors.data());
         assert(output == expected);
         output[8] ^= 1;
         assert(output != expected);
         for (auto error : errors) assert(error == 0);
         slots[112] = 4;
         for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x)
-            Expand(packed.data(), slots, output.data() + 8, 6, words, 56, 4, errors.data());
+            Expand<words * 128U>(packed.data(), slots, output.data() + 8, 6, 56, 4, errors.data());
         unsigned bad = 0;
         for (auto error : errors) bad += error;
         assert(bad == 1);
     }
 }
+template <unsigned words>
+void run_all()
+{
+    check<words>();
+    if constexpr (words < 56U) run_all<words + 1U>();
+}
+int main() { run_all<1>(); }
 """,
         encoding="utf-8",
     )
@@ -1081,13 +1212,13 @@ def _gloo_preflight_worker(rank, store_path):
                 recv, _, recv_weights, handle, _ = buffer.dispatch(
                     x, topk_idx=indices, topk_weights=weights, num_experts=2
                 )
-                assert calls["all_gather"] == (4 if debug else 0)
+                assert calls["all_gather"] == (4 if debug else 2)
                 assert calls["sync"] == (2 if debug else 0) and calls["cpu"] == 1
                 calls.clear()
                 buffer.combine(recv, handle, async_with_compute_stream=True)
                 buffer.dispatch(x, handle=handle, do_cpu_sync=False, async_with_compute_stream=True)
                 buffer.combine(recv, handle, topk_weights=recv_weights, async_with_compute_stream=True)
-                assert calls["all_gather"] == (4 if debug else 0)
+                assert calls["all_gather"] == (4 if debug else 2)
                 assert calls["sync"] == calls["cpu"] == calls["notify"] == 0
 
                 bad_x = tensor((2, 128), torch.float32) if rank == 1 else recv
@@ -1111,6 +1242,20 @@ def _gloo_preflight_worker(rank, store_path):
             with pytest.raises(ValueError, match=r"Dispatch preflight failed on ranks \[1\]"):
                 buffer.dispatch(x, topk_idx=indices, num_experts=2, do_cpu_sync=False if rank else None)
             patch.setattr(buffer, "_notify", original_notify)
+            from deep_ep import _jit
+
+            runtime.debug_collectives = False
+            for failure in ("simulated peer compiler failure", "requires at least 64 AIVs"):
+
+                def prepare_on_rank(*args):
+                    if rank == 1:
+                        raise RuntimeError(failure)
+
+                patch.setattr(_jit, "prepare", prepare_on_rank)
+                dispatches = calls["dispatch"]
+                with pytest.raises(ValueError, match=r"Dispatch preflight failed on ranks \[1\]"):
+                    buffer.dispatch(x, handle=handle, do_cpu_sync=False)
+                assert calls["dispatch"] == dispatches
     finally:
         dist.destroy_process_group()
 
@@ -1170,6 +1315,7 @@ def test_dispatch_control_reuse_host_waits(tmp_path):
 #include "kernels/dispatch/tiling.hpp"
 using ascend_deepep::DispatchTiling;
 std::string calls;
+std::vector<unsigned> barrier_cores, kernel_cores;
 bool fail_clear = false;
 struct Session {
 """
@@ -1201,12 +1347,16 @@ int aclrtMemsetAsync(void*, size_t bytes, int value, size_t count, void*)
 }
 void notify_dispatch_barrier_kernel_do(void*, unsigned cores)
 {
-    assert(cores == 64);
+    barrier_cores.push_back(cores);
     calls += 'B';
 }
-void dispatch_kernel_do(void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*)
+namespace dispatch_jit {
+struct Prepared { unsigned num_blocks = 64; };
+void launch(const Prepared& prepared, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, const DispatchTiling&)
 {
+    kernel_cores.push_back(prepared.num_blocks);
     calls += 'K';
+}
 }
 struct DevicePhaseTiming {
     explicit DevicePhaseTiming(bool enabled)
@@ -1231,6 +1381,7 @@ std::vector<float> run(Session& session, const DispatchTiling& t, bool with_weig
     uint8_t *destinations = nullptr, *forward = nullptr, *counts = nullptr, *scales = nullptr;
     uint8_t* weights = with_weights ? workspace : nullptr;
     auto config = t;
+    const dispatch_jit::Prepared prepared{};
 """
         + body
         + r"""
@@ -1241,10 +1392,15 @@ int main()
     Session session;
     auto check = [&](const DispatchTiling& t, bool weights, bool cold, bool benchmark = false, bool entry = false) {
         calls.clear();
+        barrier_cores.clear();
+        kernel_cores.clear();
         run(session, t, weights, benchmark, entry);
         const auto clears = 3U + t.world * (t.fp8 + unsigned(weights));
         const std::string launch = benchmark ? "BKBF" : (entry ? "BKF" : "KF");
         assert(calls == (cold ? "SH" + std::string(clears, 'Z') + "SH" + launch : launch));
+        const auto barriers = benchmark ? 2U : (entry ? 1U : 0U);
+        assert(barrier_cores == std::vector<unsigned>(barriers, 64));
+        assert(kernel_cores == std::vector<unsigned>(1, 64));
     };
     for (bool fp8 : {false, true})
         for (bool weights : {false, true}) {
@@ -1268,6 +1424,19 @@ int main()
                 assert(!session.dispatch_controls_valid_);
                 fail_clear = false;
                 check(t, weights, true);
+            }
+        }
+    // EP2 keeps the original fixed-64 payload and optional benchmark barriers,
+    // on both cold and reused controls.
+    for (bool fp8 : {false, true})
+        for (bool weights : {false, true}) {
+            auto t = ascend_deepep::MakeDispatchTiling(0, 2, 16, 6, 16, 32, fp8, weights, 128);
+            for (unsigned mode : {0U, 1U, 2U}) {
+                const bool benchmark = mode == 2U;
+                const bool entry = mode == 1U;
+                session.invalidate_dispatch_controls();
+                check(t, weights, true, benchmark, entry);
+                check(t, weights, false, benchmark, entry);
             }
         }
 }
@@ -1416,7 +1585,7 @@ def expected_payload(routes, experts, rank, generation, fp8, *, entries=None, wi
     return hidden, scales, weights
 
 
-_PROFILE_KERNELS = {"notify": "notify_full_kernel", "dispatch": "dispatch_kernel", "combine": "combine_kernel"}
+_PROFILE_KERNELS = {"notify": "notify_full_kernel", "dispatch": "dispatch_jit_kernel", "combine": "combine_kernel"}
 
 
 add_profile_args = _profile["add_profile_args"]

@@ -19,6 +19,8 @@ prune deep_ep/.native-build
 prune deep_ep/.libs
 recursive-exclude deep_ep *.so *.so.*
 exclude deep_ep/_build_info.json
+prune deep_ep/jit
+recursive-include third-party/deep_jit *.hpp *.h LICENSE REVISION
 recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE
 include experiments/__init__.py
 include experiments/ep_gmm_fused/tests/requirements.txt

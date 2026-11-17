@@ -40,6 +40,10 @@ def load_native_module() -> ModuleType:
 
         module = importlib.import_module("deep_ep._clos_C")
 
+        from ._jit import validate_native
+
+        validate_native(module)
+
         from .dtypes import topk_idx_t
 
         compiled_topk_idx_t = getattr(module, "topk_idx_t", None)

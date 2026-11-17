@@ -102,20 +102,20 @@ __aicore__ inline void Send(GM_ADDR region, uint32_t capacity, const DispatchTil
     peer.face ^= 1U;
 }
 
-template <bool Profile, typename WqeScratch>
+template <bool Profile, uint32_t World, uint32_t TopK, typename WqeScratch>
 __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const PeerAuxPlan& plan,
                            AscendC::TBuf<AscendC::QuePosition::VECCALC>& scratch,
                            AscendC::TBuf<AscendC::QuePosition::VECCALC>& local_scratch, WqeScratch& wqe_scratch)
 {
     const uint32_t stride = 0U;
-    const auto layout = ascend_deepep::aux_pipeline::Make(t.world, stride);
+    const auto layout = ascend_deepep::aux_pipeline::Make(World, stride);
     if (!layout.batch || !plan.weights || (t.output_rows && !plan.output_weights)) {
         aclshmemi_kernel_abort("invalid auxiliary pipeline layout");
         return;
     }
     const uint32_t owner = AscendC::GetBlockIdx() - 32U;
-    const uint32_t peers = owner < t.world ? (t.world - 1U - owner) / 32U + 1U : 0U;
-    const uint32_t routes = t.tokens * t.topk;
+    const uint32_t peers = owner < World ? (World - 1U - owner) / 32U + 1U : 0U;
+    const uint32_t routes = t.tokens * TopK;
     uint32_t address_shift = 0;
     for (uint32_t value = plan.address_stride; value > 1U; value >>= 1U) ++address_shift;
     const uint32_t capacity = t.weight_capacity;
@@ -152,7 +152,7 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
     for (uint32_t p = 0; p < peers; ++p) {
-        state[p].rank = (owner + p * 32U + t.rank) % t.world;
+        state[p].rank = (owner + p * 32U + t.rank) % World;
         WaitDispatchPeerEpoch(workspace, t, state[p].rank);
     }
     // One GM route/weight load per tile, independent of the number of peers.
@@ -243,7 +243,7 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
     c[1] = Clock<Profile>();
     auto packed = scratch.GetWithOffset<uint8_t>(layout.buffer_bytes, layout.packed_offset);
     auto meta = scratch.GetWithOffset<int32_t>(layout.buffer_bytes / 4U, layout.packed_offset);
-    for (uint32_t source = owner; source < t.world; source += 32U) {
+    for (uint32_t source = owner; source < World; source += 32U) {
         if (source == t.rank) {
             continue;
         }

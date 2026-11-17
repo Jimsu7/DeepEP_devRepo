@@ -17,6 +17,7 @@
 
 #include "common/check.h"
 #include "common/dispatch_output.h"
+#include "jit/runtime.hpp"
 #include "ops/launcher.h"
 #include "ops/aggregate.h"
 #include "ops/combine.h"
@@ -25,7 +26,7 @@
 #include "shmem.h"
 #include "tiling/platform/platform_ascendc.h"
 
-extern "C" uint64_t v1_token_schedule_abi_3();
+extern "C" uint64_t direct_aot_dispatch_split_abi_1();
 
 namespace ascend_deepep::runtime {
 namespace {
@@ -143,9 +144,14 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
           v1_token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
           udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker))
 {
-    TORCH_CHECK(v1_token_schedule_abi_3() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
-                                              uint64_t(sizeof(ascend_deepep::CombineTilingData))),
+    // Non-Dispatch operators retain their AOT library. This distinct export
+    // also rejects a stale pre-split library that still contains Dispatch.
+    TORCH_CHECK(direct_aot_dispatch_split_abi_1() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
+                                                      uint64_t(sizeof(ascend_deepep::CombineTilingData))),
                 "Kernel/native tiling ABI mismatch; rebuild and install with scripts/build.sh");
+    // Python prepares only payload Dispatch and coordinates failures before
+    // this constructor; the generated source checks its tiling field ABI.
+    direct_jit::ensure_prepared(transport_ == "udma" ? "udma" : "mte");
 
     ValidateHugePageMode(use_1g_huge_pages_, num_bytes_, data_op_engine_type_);
     num_device_aiv_ = GetDeviceNumAiv();

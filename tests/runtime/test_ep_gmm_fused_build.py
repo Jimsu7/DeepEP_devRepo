@@ -102,9 +102,21 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
         "python_executable": "/private/python",
         "build_environment": {"CXXFLAGS": "-I/private/include"},
         "ep_gmm_fused": {"enabled": ep_gmm_fused, "lineinfo": False},
+        "dispatch_jit": {
+            "revision": "pinned-deepjit",
+            "headers": {"include/deep_jit/backend/ascend/backend.hpp": "sha256"},
+            "torch": "test-torch",
+            "torch_npu": "test-torch-npu",
+            "torch_cxx11_abi": True,
+        },
+        "dispatch_jit_paths": {"Torch_DIR": "/private/torch/cmake", "TORCH_NPU_PATH": "/private/torch_npu"},
     }
     if ep_gmm_fused:
-        configuration["ep_gmm_fused_paths"] = {"SHMEM_SOURCE_PATH": "/private/shmem"}
+        configuration["ep_gmm_fused_paths"] = {
+            **configuration["dispatch_jit_paths"],
+            "SHMEM_SOURCE_PATH": "/private/shmem",
+            "CATCCOS_SOURCE_PATH": "/private/catccos",
+        }
     monkeypatch.setattr(build, "build_configuration", lambda: configuration)
     monkeypatch.setenv("MAX_JOBS", max_jobs)
     if cmake_jobs is None:
@@ -136,6 +148,11 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
             (directory / "capabilities.json").write_text(json.dumps(capabilities))
         if "--install" in argv:
             (destination / "libdeepep_kernels.so").write_bytes(b"new")
+            (destination / "libdeepep_clos_kernels.so").write_bytes(b"non-Dispatch AOT")
+            for name in build.jit_source_paths():
+                path = destination / "jit" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"installed JIT source")
             if ep_gmm_fused:
                 component.mkdir(parents=True)
 
@@ -155,14 +172,22 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}" in calls[0]
+    assert "-DTorch_DIR=/private/torch/cmake" in calls[0]
+    assert "-DTORCH_NPU_PATH=/private/torch_npu" in calls[0]
+    assert ("-DSHMEM_SOURCE_PATH=/private/shmem" in calls[0]) is ep_gmm_fused
+    assert ("-DCATCCOS_SOURCE_PATH=/private/catccos" in calls[0]) is ep_gmm_fused
     assert calls[1][-2:] == ["--parallel", expected_jobs]
     assert not (destination / "libdeepep_notify.so").exists()
+    assert (destination / "libdeepep_clos_kernels.so").read_bytes() == b"non-Dispatch AOT"
     assert all(not (destination / name).exists() for name in obsolete_modules)
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
     assert "ep_gmm_fused_paths" not in info
+    assert "dispatch_jit_paths" not in info
+    assert info["dispatch_jit"] == configuration["dispatch_jit"]
+    assert set(info["jit_sources"]) == {path.as_posix() for path in build.jit_source_paths()}
     assert info["ep_gmm_fused"]["enabled"] is ep_gmm_fused
     if ep_gmm_fused:
         assert not (component / "LICENSE").exists()
@@ -347,6 +372,8 @@ def sdk_environment(build, monkeypatch, tmp_path):
         sdk / "src/device/gm2gm/shmemi_device_cc.h": "device implementation",
         sdk / "lib/libshmem.so": "library",
         source / "VERSION": "0.1.0",
+        source / "third-party/deep_jit/REVISION": "deepjit-test-revision",
+        source / "third-party/deep_jit/include/deep_jit/backend/ascend/backend.hpp": "jit declarations",
         tmp_path / "compiler": "host compiler",
     }
     for path, data in files.items():
@@ -415,6 +442,19 @@ def test_lineinfo_only_affects_component_builds(build, sdk_environment, ep_gmm_f
         configuration = build.build_configuration(env)
         assert configuration["build_type"] == expected
         assert configuration["ep_gmm_fused"]["lineinfo"] is (ep_gmm_fused and lineinfo == "ON")
+        assert configuration["dispatch_jit"]["revision"] == "deepjit-test-revision"
+        assert configuration["dispatch_jit"]["headers"] == {
+            "include/deep_jit/backend/ascend/backend.hpp": hashlib.sha256(b"jit declarations").hexdigest()
+        }
+        assert configuration["dispatch_jit"]["torch"] == "test"
+        assert configuration["dispatch_jit"]["torch_npu"] == "test"
+        assert configuration["dispatch_jit"]["torch_cxx11_abi"] is True
+        assert set(configuration["dispatch_jit_paths"]) == {"Torch_DIR", "TORCH_NPU_PATH"}
+        if ep_gmm_fused:
+            for name in ("torch", "torch_npu", "torch_cxx11_abi"):
+                assert configuration["ep_gmm_fused"][name] == configuration["dispatch_jit"][name]
+            for name, path in configuration["dispatch_jit_paths"].items():
+                assert configuration["ep_gmm_fused_paths"][name] == path
 
 
 @pytest.mark.parametrize("component", ["ep_gmm_fused", "other", "nested"])

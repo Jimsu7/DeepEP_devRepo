@@ -3,11 +3,12 @@
 
 // Each pair is (source row, final peer row). The caller selects input or received GM.
 // No per-WQE branch or CQE selection; the header fixes every data WQE to RO/no-CQE.
+template <uint32_t RowBytes>
 __simt_vf__ __launch_bounds__(32) inline void DispatchBuildFmWqesVf(__ubuf__ uint64_t* wqes, __ubuf__ uint64_t* header,
                                                                     __ubuf__ int32_t* rows, uint32_t first,
-                                                                    uint32_t count, uint32_t row_bytes, uint64_t source,
-                                                                    uint64_t target)
+                                                                    uint32_t count, uint64_t source, uint64_t target)
 {
+    constexpr uint32_t row_bytes = RowBytes;
     for (uint32_t i = threadIdx.x; i < count; i += 32U) {
         auto* sqe = wqes + uint64_t(i) * 8U;
         const uint32_t row = (first + i) * 2U;
@@ -22,7 +23,9 @@ __simt_vf__ __launch_bounds__(32) inline void DispatchBuildFmWqesVf(__ubuf__ uin
     }
 }
 
-__aicore__ inline void InitFmPrimaryContext(DeepepPrimaryState& p, uint32_t peer, __ubuf__ uint8_t* scratch)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void InitFmPrimaryContext(DeepepPrimaryState<World, RowBytes, TopK>& p, uint32_t peer,
+                                            __ubuf__ uint8_t* scratch)
 {
     auto& s = *p.secondary;
     auto* header = reinterpret_cast<__ubuf__ uint64_t*>(scratch);
@@ -55,8 +58,10 @@ __aicore__ inline void InitFmPrimaryContext(DeepepPrimaryState& p, uint32_t peer
 
 // Contiguous (input token, final output row) ranges prepared alongside Notify.
 // Each metadata tile is read once; each VF builds 32 RO/no-CQE descriptors.
-__aicore__ inline void IssueFmPrimaryPlanRange(DeepepPrimaryState& p, uint32_t peer, uint32_t begin, uint32_t count,
-                                               __ubuf__ uint8_t* scratch, LocalTensor<uint32_t> records)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+__aicore__ inline void IssueFmPrimaryPlanRange(DeepepPrimaryState<World, RowBytes, TopK>& p, uint32_t peer,
+                                               uint32_t begin, uint32_t count, __ubuf__ uint8_t* scratch,
+                                               LocalTensor<uint32_t> records)
 {
     if (!count) return;
     auto& s = *p.secondary;
@@ -78,9 +83,9 @@ __aicore__ inline void IssueFmPrimaryPlanRange(DeepepPrimaryState& p, uint32_t p
             const uint32_t n = tile - first < 32U ? tile - first : 32U;
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            asc_vf_call<DispatchBuildFmWqesVf>(dim3(32), wqes, header,
-                                               reinterpret_cast<__ubuf__ int32_t*>(records.GetPhyAddr()), first, n,
-                                               s.row_bytes, reinterpret_cast<uint64_t>(p.input), header[5]);
+            asc_vf_call<DispatchBuildFmWqesVf<RowBytes>>(dim3(32), wqes, header,
+                                                         reinterpret_cast<__ubuf__ int32_t*>(records.GetPhyAddr()),
+                                                         first, n, reinterpret_cast<uint64_t>(p.input), header[5]);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             PublishFmPreparedRows(reinterpret_cast<__ubuf__ uint8_t*>(wqes), n, ctx, queue);

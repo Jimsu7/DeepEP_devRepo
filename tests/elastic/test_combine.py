@@ -2080,18 +2080,21 @@ void run()
     helpers += section("constexpr uint32_t kWeightThreads =", "__aicore__ inline __gm__ uint64_t* WeightFlag(")
     # Compile the production dispatch schedule too: Notify and Combine must
     # agree with it for every high-rank source/destination and credit edge.
-    dispatch_code = (root / "csrc/kernels/dispatch/dispatch.cpp").read_text(encoding="utf-8")
+    dispatch_code = (root / "csrc/kernels/dispatch/dispatch_impl.hpp").read_text(encoding="utf-8")
     helpers += "\nnamespace dispatch_contract {\n"
     helpers += dispatch_code[
         dispatch_code.index("constexpr uint32_t kMaxDispatchGroupWidth") : dispatch_code.index(
             "// 128P uses the frozen"
         )
     ]
-    helpers += dispatch_code[
-        dispatch_code.index("__aicore__ inline uint32_t GetDispatchGroupWidth(") : dispatch_code.index(
-            "__aicore__ inline void DispatchSplitRange("
-        )
-    ]
+    schedule_begin = dispatch_code.rfind(
+        "template <uint32_t World>", 0, dispatch_code.index("__aicore__ inline uint32_t GetDispatchGroupWidth(")
+    )
+    helpers += dispatch_code[schedule_begin : dispatch_code.index("__aicore__ inline void DispatchSplitRange(")]
+    helpers += "\nuint32_t GetGroupRankIndex(uint32_t rank, uint32_t world) {\n    switch (world) {\n"
+    for world in (2, 4, 8, 16, 32, 64, 128, 256, 512):
+        helpers += f"    case {world}: return GetGroupRankIndex<{world}>(static_cast<int32_t>(rank));\n"
+    helpers += "    default: std::abort();\n    }\n}\n"
     helpers += "\n}\n"
 
     def function(source, name):
@@ -2298,12 +2301,9 @@ void large_shape_test()
     ):
         begin = transport.index(declaration)
         credit_parts.append(transport[begin : transport.index(";", begin) + 1])
-    for signature in (
-        "__aicore__ inline void PauseClosAckPoll(",
-        "__aicore__ inline bool EnsureClosSqCredit(",
-    ):
-        begin = transport.index(signature)
-        credit_parts.append(transport[begin : transport.index("\n}\n", begin) + 3])
+    from tests.utils.cpp import cpp_functions
+
+    credit_parts.append(cpp_functions(transport, "PauseClosAckPoll", "EnsureClosSqCredit"))
     credit_helper = "\n".join(credit_parts)
     helpers += (
         r"""
@@ -2324,9 +2324,10 @@ void Nop()
 struct aclshmemi_udma_queue_state_t {
     uint32_t sq_head = 0, sq_tail = 0, cqe_cnt = 0, cq_tail = 0;
 } queue;
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
 struct DeepepSecondaryState {
     uint64_t clos_relay_mailbox = 0, magic = 17;
-    uint32_t rank = 0, world = 512, clos_table_owner = 0;
+    uint32_t rank = 0, clos_table_owner = 0;
     uint8_t* sync = nullptr;
 };
 constexpr uint32_t MAX_RETRY_TIMES = 100, PIPE_MTE3 = 0, EVENT_ID0 = 0, kUdmaSyncSoCqeConfig = 0,
@@ -2357,7 +2358,8 @@ void trap()
 {
     assert(false);
 }
-uint32_t GetGroupRankIndex(uint32_t p, uint32_t)
+template <uint32_t World>
+uint32_t GetGroupRankIndex(uint32_t p)
 {
     return p;
 }
@@ -2365,7 +2367,8 @@ uint64_t* GetPeerCompletionFlag(uint32_t, uint32_t, uint32_t, uint8_t*)
 {
     return &sink;
 }
-uint32_t DeepepTransportQp(DeepepSecondaryState&, uint32_t, uint32_t q)
+template <uint32_t World, uint32_t RowBytes, uint32_t TopK>
+uint32_t DeepepTransportQp(DeepepSecondaryState<World, RowBytes, TopK>&, uint32_t, uint32_t q)
 {
     return q;
 }
@@ -2390,7 +2393,7 @@ void aclshmemx_udma_qp_quiet(uint32_t, uint32_t)
 
 void run()
 {
-    DeepepSecondaryState s;
+    DeepepSecondaryState<512U, 128U, 6U> s;
     uint8_t scratch[512]{};
     assert(EnsureClosSqCredit(s, 511, 0, 0, &queue, 64, scratch));
     assert(!ack_reads && !checkpoints);

@@ -194,7 +194,6 @@ class Buffer:
         self._lock = RLock()
         self._destroyed = False
         self._failed_event_tensors: Optional[Tuple[Any, ...]] = None
-        native_type = get_native_class("BufferRuntime")
         with _BOOTSTRAP_LOCK:
             unique_id, bootstrap_key = _prepare_shmem_bootstrap(
                 resolved_group,
@@ -214,6 +213,7 @@ class Buffer:
                     else {}
                 ),
             )
+            native_type = get_native_class("BufferRuntime")
             self._native = native_type(
                 rank,
                 resolved_num_ranks,
@@ -1242,7 +1242,15 @@ def _prepare_shmem_bootstrap(
     udma_peer_options=(0, 0, 0),
     udma_auto_options=None,
 ):
-    native = load_native_module()
+    native, load_error = None, None
+    try:
+        native = load_native_module()
+    except Exception as exc:
+        load_error = f"{type(exc).__name__}: {exc}"
+    load_errors = _bootstrap_all_gather(group, comm, size, load_error)
+    if any(error is not None for error in load_errors):
+        details = "; ".join(f"rank {peer}: {error}" for peer, error in enumerate(load_errors) if error is not None)
+        raise RuntimeError(f"Direct native load failed collectively before SHMEM initialization: {details}")
     options = (
         num_bytes,
         transport,
@@ -1266,6 +1274,9 @@ def _prepare_shmem_bootstrap(
         raise RuntimeError("CANN SHMEM already has an active Buffer for a different group or configuration")
     if any(peer[1] != state or peer[2] != uid for peer in peers):
         raise RuntimeError("inconsistent active SHMEM sessions across EP ranks")
+    from ._jit import prepare_collectively
+
+    prepare_collectively(native, transport, lambda value: _bootstrap_all_gather(group, comm, size, value))
     if state or ip_port is not None:
         return uid, key
 

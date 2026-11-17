@@ -18,11 +18,11 @@ __aicore__ inline void DrainDispatchStores(const DispatchTiling& t, uint64_t* de
 // self-contained 512B data-with-flag packets, per-peer ping-pong and SIMT scatter.
 #include "scale_pipeline.hpp"
 #include "aux_pipeline.hpp"
-template <bool Profile>
+template <bool Profile, uint32_t World, uint32_t Hidden, uint32_t TopK>
 __aicore__ inline void PeerScales(GM_ADDR workspace, GM_ADDR input, GM_ADDR destinations, const DispatchTiling& t,
                                   TBuf<QuePosition::VECCALC>& metadata, TBuf<QuePosition::VECCALC>& staging,
                                   TBuf<TPosition::VECOUT>& wqe_scratch)
 {
     PeerScalePlan plan{destinations, input, reinterpret_cast<GM_ADDR>(t.output_scales_address), t.address_stride};
-    DispatchScalePipeline::Run<Profile>(workspace, t, plan, staging, metadata, wqe_scratch);
+    DispatchScalePipeline::Run<Profile, World, Hidden, TopK>(workspace, t, plan, staging, metadata, wqe_scratch);
 }

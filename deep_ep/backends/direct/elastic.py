@@ -290,7 +290,6 @@ class ElasticBuffer:
         self._aggregate_pipeline_chunk_tokens = 0
         _validate_group_consensus(resolved_group, "udma_peers_per_worker", udma_peers_per_worker)
         _validate_group_consensus(resolved_group, "udma_wqes_per_visit", udma_wqes_per_visit)
-        native_type = get_native_class("BufferRuntime")
         with _BOOTSTRAP_LOCK:
             unique_id, bootstrap_key = _prepare_shmem_bootstrap(
                 resolved_group,
@@ -310,6 +309,7 @@ class ElasticBuffer:
                     else {}
                 ),
             )
+            native_type = get_native_class("BufferRuntime")
             self._native = native_type(
                 rank,
                 num_ranks,

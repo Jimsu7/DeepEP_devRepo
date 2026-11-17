@@ -314,6 +314,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     }
 }
 
+#if !defined(DEEPEP_DIRECT_JIT_ENTRY) || DEEPEP_DIRECT_JIT_ENTRY == 12
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_dispatch_udma_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
@@ -326,7 +327,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_dispatch_
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, tiling, ffts_addr);
 }
+#endif  // DEEPEP_DIRECT_JIT_ENTRY
 
+#if !defined(DEEPEP_DIRECT_JIT_ENTRY)
 extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
     uint8_t* num_tokens_per_rank, uint8_t* is_token_in_rank, uint8_t* num_tokens_per_expert, uint8_t* symmetric_buffer,
@@ -340,8 +343,4 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
 }
-
-extern "C" ASCEND_DEEPEP_EXPORT uint64_t v1_token_schedule_abi_3() {
-    return (uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
-           uint64_t(sizeof(ascend_deepep::CombineTilingData));
-}
+#endif  // DEEPEP_DIRECT_JIT_ENTRY

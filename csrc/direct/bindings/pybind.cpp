@@ -8,12 +8,22 @@
  */
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 #include "common/types.h"
+#include "jit/runtime.hpp"
 #include "runtime/shmem_instance.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.attr("direct_jit_abi") = 2;
+    m.attr("direct_jit_types_sha256") = DEEPEP_DIRECT_TYPES_SHA256;
+    m.def("init_direct_jit", &ascend_deepep::direct_jit::initialize,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("prepare_direct_jit", &ascend_deepep::direct_jit::prepare,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("direct_jit_prepared_entries", &ascend_deepep::direct_jit::prepared_entries,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     // Keep the Python dtype contract tied to the native V1 dispatch path.
